@@ -3,38 +3,19 @@ const {
   generateRenewals,
   getRenewalHistory,
   processWebhook,
+  retryRenewal,
 } = require('../services/renewalService');
 const {
   validateRenewalHistoryQuery,
   validateGenerateRenewals,
+  validateRetryRenewal,
 } = require('../middleware/validation');
 const { getCurrentBillingMonth } = require('../utils/billingHelpers');
 
 const router = Router();
 
-// ---------------------------------------------------------------------------
 // POST /api/renewals/generate
-// ---------------------------------------------------------------------------
-
-/**
- * Generates renewal events for all active subscriptions for a given month.
- *
- * Body (optional):
- *   { "month": "YYYY-MM" }   — defaults to current UTC month if omitted.
- *
- * Step 2 — validateGenerateRenewals middleware validates the `month` body
- * field and returns 400 if malformed.
- *
- * Step 1 — generateRenewals() uses insertMany + ordered:false so duplicate
- * entries are counted, not silently swallowed, and only real DB errors throw.
- *
- * Response 200:
- *   {
- *     "billingMonth": "2024-03",
- *     "newlyCreated": 42,
- *     "existingCount": 3
- *   }
- */
+// Generates renewal events for all active subscriptions for the given billing month.
 router.post('/generate', validateGenerateRenewals, async (req, res, next) => {
   try {
     const billingMonth = req.body.month ?? getCurrentBillingMonth();
@@ -50,32 +31,8 @@ router.post('/generate', validateGenerateRenewals, async (req, res, next) => {
   }
 });
 
-// ---------------------------------------------------------------------------
 // GET /api/renewals
-// ---------------------------------------------------------------------------
-
-/**
- * Returns paginated renewal history for a billing month with optional filters.
- *
- * Query params (all optional):
- *   month  — YYYY-MM (defaults to current UTC month)
- *   page   — integer ≥ 1 (default: 1)
- *   limit  — integer 1–200 (default: 20)
- *   status — "scheduled" | "charged" | "failed"
- *
- * Step 2 — validateRenewalHistoryQuery middleware validates all query params
- * and returns 400 with structured JSON on failure before any DB query runs.
- *
- * Response 200:
- *   {
- *     "billingMonth": "2024-03",
- *     "page": 1,
- *     "limit": 20,
- *     "total": 87,
- *     "totalPages": 5,
- *     "data": [ ...RenewalEvent documents with populated subscription... ]
- *   }
- */
+// Returns paginated renewal history for a billing month with optional status filter.
 router.get('/', validateRenewalHistoryQuery, async (req, res, next) => {
   try {
     const billingMonth = req.query.month ?? getCurrentBillingMonth();
@@ -94,21 +51,8 @@ router.get('/', validateRenewalHistoryQuery, async (req, res, next) => {
   }
 });
 
-// ---------------------------------------------------------------------------
 // POST /api/renewals/:id/webhook
-// ---------------------------------------------------------------------------
-
-/**
- * Processes a payment provider webhook for a single renewal event.
- *
- * Body:
- *   {
- *     "outcome": "charged" | "failed",
- *     "failureReason": "string (optional, only when outcome is 'failed')"
- *   }
- *
- * Business rule: If the event is already `charged`, this is a no-op (idempotent).
- */
+// Payment provider webhook callback. Idempotent: 'charged' records are immutable.
 router.post('/:id/webhook', async (req, res, next) => {
   try {
     const { outcome, failureReason } = req.body;
@@ -127,6 +71,24 @@ router.post('/:id/webhook', async (req, res, next) => {
   } catch (err) {
     if (err.statusCode === 404) {
       return res.status(404).json({ error: err.message });
+    }
+    next(err);
+  }
+});
+
+// POST /api/renewals/:id/retry
+// Resets a failed renewal back to 'scheduled'. Rejects if already charged.
+router.post('/:id/retry', validateRetryRenewal, async (req, res, next) => {
+  try {
+    const event = await retryRenewal(req.params.id);
+    res.status(200).json({
+      message: 'Renewal charge queued for retry',
+      data: event,
+      ...event,
+    });
+  } catch (err) {
+    if (err.statusCode) {
+      return res.status(err.statusCode).json({ error: err.message });
     }
     next(err);
   }
