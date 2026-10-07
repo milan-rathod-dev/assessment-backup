@@ -1,27 +1,20 @@
-/**
- * Integration tests for Step 1 (Duplicate Prevention) and Step 2 (Input Validation).
- *
- * Uses supertest to make real HTTP requests against the Express app.
- * MongoDB is mocked using jest.mock so no real DB connection is needed.
- */
 const request = require('supertest');
 const app = require('../src/app');
 
-// ---------------------------------------------------------------------------
-// Mock the renewal service so DB calls are not made in unit tests
-// ---------------------------------------------------------------------------
 jest.mock('../src/services/renewalService', () => ({
   generateRenewals: jest.fn(),
   getRenewalHistory: jest.fn(),
   processWebhook: jest.fn(),
+  retryRenewal: jest.fn(),
 }));
 
-const { generateRenewals, getRenewalHistory } = require('../src/services/renewalService');
+const {
+  generateRenewals,
+  getRenewalHistory,
+  retryRenewal,
+} = require('../src/services/renewalService');
 
-// ---------------------------------------------------------------------------
-// Step 2: Input Validation — POST /api/renewals/generate
-// ---------------------------------------------------------------------------
-describe('POST /api/renewals/generate — input validation (Step 2)', () => {
+describe('POST /api/renewals/generate — input validation', () => {
   beforeEach(() => jest.clearAllMocks());
 
   test('returns 200 with valid month body', async () => {
@@ -54,7 +47,7 @@ describe('POST /api/renewals/generate — input validation (Step 2)', () => {
   test('returns 400 for invalid month format', async () => {
     const res = await request(app)
       .post('/api/renewals/generate')
-      .send({ month: '2024-3' }); // missing leading zero
+      .send({ month: '2024-3' });
 
     expect(res.status).toBe(400);
     expect(res.body.error).toBe('Validation failed');
@@ -89,10 +82,7 @@ describe('POST /api/renewals/generate — input validation (Step 2)', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Step 2: Input Validation — GET /api/renewals
-// ---------------------------------------------------------------------------
-describe('GET /api/renewals — input validation (Step 2)', () => {
+describe('GET /api/renewals — input validation', () => {
   beforeEach(() => jest.clearAllMocks());
 
   test('returns 200 with valid query params', async () => {
@@ -156,7 +146,7 @@ describe('GET /api/renewals — input validation (Step 2)', () => {
   test('returns 400 for invalid status filter', async () => {
     const res = await request(app)
       .get('/api/renewals')
-      .query({ status: 'pending' }); // not in allowed enum
+      .query({ status: 'pending' });
 
     expect(res.status).toBe(400);
     expect(res.body.details[0].field).toBe('status');
@@ -188,10 +178,7 @@ describe('GET /api/renewals — input validation (Step 2)', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Step 1: Duplicate Prevention response shape
-// ---------------------------------------------------------------------------
-describe('POST /api/renewals/generate — duplicate prevention response (Step 1)', () => {
+describe('POST /api/renewals/generate — duplicate prevention response', () => {
   beforeEach(() => jest.clearAllMocks());
 
   test('response includes newlyCreated and existingCount', async () => {
@@ -228,5 +215,59 @@ describe('POST /api/renewals/generate — duplicate prevention response (Step 1)
 
     expect(res.body.newlyCreated).toBe(0);
     expect(res.body.existingCount).toBe(5);
+  });
+});
+
+describe('POST /api/renewals/:id/retry — Retry Failed Charges', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  const validId = '507f1f77bcf86cd799439011';
+
+  test('successfully retries a failed renewal and returns 200', async () => {
+    const mockUpdated = {
+      _id: validId,
+      status: 'scheduled',
+      failureReason: null,
+      amountCents: 1999,
+      gstCents: 360,
+    };
+    retryRenewal.mockResolvedValue(mockUpdated);
+
+    const res = await request(app).post(`/api/renewals/${validId}/retry`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.message).toBe('Renewal charge queued for retry');
+    expect(res.body.status).toBe('scheduled');
+    expect(res.body.failureReason).toBeNull();
+  });
+
+  test('returns 400 when attempting to retry an already charged renewal', async () => {
+    const error = new Error('Cannot retry a renewal event that is already charged');
+    error.statusCode = 400;
+    retryRenewal.mockRejectedValue(error);
+
+    const res = await request(app).post(`/api/renewals/${validId}/retry`);
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/already charged/);
+  });
+
+  test('returns 404 when renewal event is not found', async () => {
+    const error = new Error(`RenewalEvent ${validId} not found`);
+    error.statusCode = 404;
+    retryRenewal.mockRejectedValue(error);
+
+    const res = await request(app).post(`/api/renewals/${validId}/retry`);
+
+    expect(res.status).toBe(404);
+    expect(res.body.error).toMatch(/not found/);
+  });
+
+  test('returns 400 validation error for invalid ObjectId parameter', async () => {
+    const res = await request(app).post('/api/renewals/invalid-id/retry');
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('Validation failed');
+    expect(res.body.details[0].field).toBe('id');
   });
 });
